@@ -9,11 +9,19 @@ Usage:
     python main.py output/trimmed.mp4
     python main.py output/trimmed.mp4 --steps captions,broll,subtitle_styles
     python main.py output/trimmed.mp4 --steps subtitle_styles --subtitle-style boxed --subtitle-font modern
+    python main.py output/trimmed.mp4 --steps subtitle_styles --subtitle-preset studio
+
+--subtitle-preset picks one of subtitle_styles.STYLE_PRESETS (font + colors +
+emphasis + transition bundled together, e.g. "studio", "editorial", "impact",
+"kinetic"). If given, it wins over --subtitle-style/--subtitle-font for that
+run -- same precedence as subtitle_styles.run()'s preset_name argument.
+--subtitle-style/--subtitle-font still work on their own exactly as before.
 """
 
 import sys
 from steps.project_store import create_project
 from steps.registry import run_all, STEP_ORDER
+from steps.subtitle_styles import STYLE_PRESETS
 
 
 def run(video_path: str, steps: list = None, step_params: dict = None):
@@ -29,9 +37,13 @@ def run(video_path: str, steps: list = None, step_params: dict = None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python main.py <path_to_trimmed_video> [--steps step1,step2,...] "
-              "[--subtitle-style default|boxed|highlight] [--subtitle-font FONT_PRESET]")
+        print(
+            "Usage: python main.py <path_to_trimmed_video> [--steps step1,step2,...] "
+            "[--subtitle-style default|boxed|highlight] [--subtitle-font FONT_PRESET] "
+            "[--subtitle-preset PRESET_NAME]"
+        )
         print(f"Available steps: {STEP_ORDER}")
+        print(f"Available subtitle presets: {list(STYLE_PRESETS.keys())}")
         sys.exit(1)
 
     video_path = sys.argv[1]
@@ -52,5 +64,12 @@ if __name__ == "__main__":
     if "--subtitle-font" in args:
         idx = args.index("--subtitle-font")
         step_params.setdefault("subtitle_styles", {})["font_name"] = args[idx + 1]
+    if "--subtitle-preset" in args:
+        idx = args.index("--subtitle-preset")
+        preset_name = args[idx + 1]
+        if preset_name not in STYLE_PRESETS:
+            print(f"Unknown preset '{preset_name}'. Choose from: {list(STYLE_PRESETS.keys())}")
+            sys.exit(1)
+        step_params.setdefault("subtitle_styles", {})["preset_name"] = preset_name
 
     run(video_path, steps=steps, step_params=step_params or None)

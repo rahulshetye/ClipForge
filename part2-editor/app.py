@@ -21,6 +21,26 @@ scanning the whole projects/ directory. If a project.json file is ever
 missing despite an index entry existing, /projects/{project_id} still
 404s correctly -- the index is a pointer, not a guarantee.
 
+SUBTITLE PRESETS (subtitle_styles.STYLE_PRESETS): stepParams already forwards
+arbitrary per-step kwargs generically (camelCase -> snake_case, see
+_to_snake_case below), so a caller passing
+{ "subtitle_styles": { "presetName": "studio" } } reaches
+subtitle_styles.run() as preset_name="studio" with no wiring needed here.
+The one addition below is fail-fast validation: an unknown preset name is
+now rejected with 400 before the background job is even queued, instead of
+only surfacing later as a failed job status -- same "check before doing any
+work" pattern already used for the 404/403 ownership check.
+
+CAPTIONS (steps/captions.py): the same generic forwarding carries
+{ "captions": { "language": "auto"|"en"|"hi", "script": "native"|"roman",
+"onMismatch": "warn"|"raise"|"use_detected" } } to captions.run(). Those
+values are validated up front (400 before queueing). With onMismatch "raise",
+a language choice that clearly doesn't match the audio fails the job early
+with a LanguageMismatchError; that is recorded in job_status as
+details={code: "language_mismatch", requested, detected, confidence} and
+returned by GET /projects/{id} as `errorDetails`, so the frontend can ask the
+user what to do instead of showing a generic failure.
+
 Run locally with: uvicorn app:app --reload --port 8002
 Run in production with: python app.py
 """
@@ -28,6 +48,7 @@ Run in production with: python app.py
 import os
 import shutil
 import threading
+import uuid
 from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +57,8 @@ from pydantic import BaseModel
 
 from steps.project_store import create_project, load_project, save_project, MissingDependencyError
 from steps.registry import run_step, run_all, STEP_ORDER
+from steps.subtitle_styles import STYLE_PRESETS
+from steps.captions import LANG_CONFIG, LanguageMismatchError
 from auth import get_current_uid
 import firebase_admin_init  # ensures the Admin SDK (and its default app) is initialized before Firestore is used
 from firebase_admin import firestore  # reuses firebase_admin_init's credentials -- not google.cloud.firestore, which needs separate ADC
@@ -62,7 +85,9 @@ app.mount("/files", StaticFiles(directory=PROJECTS_DIR), name="files")
 # before: fine for single-instance prototype deployment, swap for
 # MongoDB/Redis if this ever runs multi-instance. The durable pipeline
 # state itself lives in projects/{id}/project.json, not here.
+# Entry shape: {"status": str, "error": str|None, "details": dict|None}
 job_status = {}
+_job_lock = threading.Lock()  # makes "is a job already running? -> claim it" atomic
 
 # Firestore client -- index only, not the source of truth for project data.
 db = firestore.client()
@@ -95,17 +120,91 @@ def _load_owned_project(project_id: str, uid: str):
     return project
 
 
+def _claim_job(project_id: str) -> None:
+    """Marks the project's job as queued, or raises 409 if one is already
+    queued/running for it. Two overlapping jobs on one project would both
+    read and write project.json and could overwrite each other's results."""
+    with _job_lock:
+        current = job_status.get(project_id)
+        if current and current["status"] in ("queued", "running"):
+            raise HTTPException(status_code=409, detail="This project is already being processed.")
+        job_status[project_id] = {"status": "queued", "error": None, "details": None}
+
+
+def _validate_step_names(steps: Optional[List[str]]) -> None:
+    """400 for an unknown step name, before anything is queued or run."""
+    if not steps:
+        return
+    valid = set(STEP_REGISTRY_NAMES())
+    unknown = [s for s in steps if s not in valid]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown step(s) {unknown}. Valid: {STEP_ORDER}")
+
+
+def _validate_step_params(step_params: Dict[str, Dict]) -> None:
+    """
+    Fail-fast checks for step params we can validate without running anything.
+    Covers subtitle_styles' preset_name and captions' language / script /
+    on_mismatch -- extend this if other steps grow similarly-checkable params.
+    Raises HTTPException(400) on a bad value rather than letting it surface
+    later as a failed background job.
+    """
+    subtitle_params = step_params.get("subtitle_styles")
+    if subtitle_params and "preset_name" in subtitle_params:
+        preset_name = subtitle_params["preset_name"]
+        if preset_name is not None and preset_name not in STYLE_PRESETS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown subtitle preset '{preset_name}'. Valid: {list(STYLE_PRESETS.keys())}",
+            )
+
+    caption_params = step_params.get("captions")
+    if caption_params:
+        language = caption_params.get("language")
+        if language is not None and language != "auto" and language not in LANG_CONFIG:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported caption language '{language}'. Valid: auto, {list(LANG_CONFIG.keys())}",
+            )
+        if caption_params.get("script", "native") not in ("native", "roman"):
+            raise HTTPException(status_code=400, detail="Caption script must be 'native' or 'roman'.")
+        if caption_params.get("on_mismatch", "warn") not in ("warn", "raise", "use_detected"):
+            raise HTTPException(
+                status_code=400,
+                detail="Caption on_mismatch must be 'warn', 'raise' or 'use_detected'.",
+            )
+
+
 def _run_in_background(project_id: str, fn):
     """Runs `fn(project)` in a background thread and updates job_status."""
     try:
-        job_status[project_id] = {"status": "running", "error": None}
+        job_status[project_id] = {"status": "running", "error": None, "details": None}
         project = load_project(project_id)
         project = fn(project)
-        job_status[project_id] = {"status": "done", "error": None}
+        job_status[project_id] = {"status": "done", "error": None, "details": None}
+    except LanguageMismatchError as e:
+        # Structured, so the frontend can offer "switch language" / "continue anyway"
+        # instead of only showing an error string.
+        job_status[project_id] = {
+            "status": "failed",
+            "error": str(e),
+            "details": {
+                "code": "language_mismatch",
+                "requested": e.requested,
+                "detected": e.detected,
+                "confidence": round(e.share, 2),
+            },
+        }
     except MissingDependencyError as e:
-        job_status[project_id] = {"status": "failed", "error": str(e)}
+        job_status[project_id] = {"status": "failed", "error": str(e), "details": None}
     except Exception as e:
-        job_status[project_id] = {"status": "failed", "error": str(e)}
+        job_status[project_id] = {"status": "failed", "error": str(e), "details": None}
+
+
+class StepRequest(BaseModel):
+    """Optional body for POST /steps/{name}: per-step kwargs in camelCase,
+    e.g. { "params": { "language": "hi", "script": "roman" } }."""
+    params: Optional[Dict] = None
 
 
 class RunAllRequest(BaseModel):
@@ -122,7 +221,11 @@ async def create(file: UploadFile = File(...), uid: str = Depends(get_current_ui
     tagged with the verified uid that owns it. Also writes a lightweight
     index entry to Firestore so this project shows up in the user's
     project history."""
-    upload_path = os.path.join(UPLOAD_DIR, file.filename)
+    # Never trust the client's filename for a path: strip any directory parts
+    # and prefix a random id so two uploads named "video.mp4" can't overwrite
+    # each other.
+    original_name = os.path.basename(file.filename or "upload.mp4")
+    upload_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{original_name}")
     with open(upload_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -134,27 +237,39 @@ async def create(file: UploadFile = File(...), uid: str = Depends(get_current_ui
     _project_index_ref(uid, project_id).set({
         "projectId": project_id,
         "createdAt": firestore.SERVER_TIMESTAMP,
-        "filename": file.filename,
+        "filename": original_name,
     })
 
     return {"projectId": project_id, "status": "created"}
 
 
 @app.post("/projects/{project_id}/steps/{step_name}")
-async def run_one_step(project_id: str, step_name: str, uid: str = Depends(get_current_uid)):
+async def run_one_step(
+    project_id: str,
+    step_name: str,
+    req: StepRequest = StepRequest(),
+    uid: str = Depends(get_current_uid),
+):
     """Runs a single step against this project's current manifest state.
     Independently callable in any order -- each step checks its own
     dependencies (e.g. broll requires captions to have run first) and
     raises a clear error if they're missing, rather than needing the
-    caller to have prior results in hand."""
+    caller to have prior results in hand.
+    Optional body { "params": { camelCaseKwarg: value } } is forwarded to the
+    step's run() as snake_case kwargs."""
     _load_owned_project(project_id, uid)  # 404/403 before doing any work
 
     if step_name not in STEP_REGISTRY_NAMES():
         raise HTTPException(status_code=404, detail=f"Unknown step '{step_name}'. Valid: {STEP_ORDER}")
 
-    job_status[project_id] = {"status": "queued", "error": None}
+    params = {_to_snake_case(k): v for k, v in (req.params or {}).items()}
+    _validate_step_params({step_name: params})  # 400 before queueing
+
+    _claim_job(project_id)  # 409 if this project is already being processed
     thread = threading.Thread(
-        target=_run_in_background, args=(project_id, lambda p: run_step(step_name, p)), daemon=True
+        target=_run_in_background,
+        args=(project_id, lambda p: run_step(step_name, p, **params)),
+        daemon=True,
     )
     thread.start()
     return {"projectId": project_id, "step": step_name, "status": "queued"}
@@ -166,7 +281,9 @@ async def run_all_steps(project_id: str, req: RunAllRequest = RunAllRequest(), u
     Runs steps sequentially in priority order (default: full STEP_ORDER).
     Body: { "steps": [...], "stepParams": { stepName: { kwarg: value } } }
     -- both optional. stepParams lets a caller pass per-step options (e.g.
-    { "subtitle_styles": { "style": "boxed", "fontName": "modern" } }),
+    { "subtitle_styles": { "style": "boxed", "fontName": "modern" } },
+    { "subtitle_styles": { "presetName": "studio" } }, or
+    { "captions": { "language": "hi", "script": "roman", "onMismatch": "raise" } }),
     forwarded to registry.run_all's step_params.
 
     NOTE: switched from a `?steps=a,b,c` query param to a JSON body, since
@@ -176,16 +293,19 @@ async def run_all_steps(project_id: str, req: RunAllRequest = RunAllRequest(), u
     """
     _load_owned_project(project_id, uid)  # 404/403 before doing any work
 
-    # registry.run_step/subtitle_styles.run expect `font_name`, not `fontName` --
-    # translate each step's param dict from the wire's camelCase to Python's
-    # snake_case here, once, rather than pushing that convention mismatch
-    # down into every individual step function.
+    _validate_step_names(req.steps)  # 400 on a typo'd step, before anything runs
+
+    # registry.run_step/subtitle_styles.run expect `font_name`/`preset_name`,
+    # not `fontName`/`presetName` -- translate each step's param dict from
+    # the wire's camelCase to Python's snake_case here, once, rather than
+    # pushing that convention mismatch down into every individual step function.
     step_params = {
         step: {_to_snake_case(k): v for k, v in params.items()}
         for step, params in (req.stepParams or {}).items()
     }
+    _validate_step_params(step_params)  # 400 before queueing, not a failed job after
 
-    job_status[project_id] = {"status": "queued", "error": None}
+    _claim_job(project_id)  # 409 if this project is already being processed
     thread = threading.Thread(
         target=_run_in_background,
         args=(project_id, lambda p: run_all(p, steps=req.steps, step_params=step_params)),
@@ -220,14 +340,16 @@ def list_projects(uid: str = Depends(get_current_uid)):
 def get_project(project_id: str, uid: str = Depends(get_current_uid)):
     """Returns the full manifest -- current video, applied steps, and all
     step data (words, broll clips, keep_ranges, etc). Poll this after
-    triggering a step to see when it's done."""
+    triggering a step to see when it's done. `errorDetails` is set only for
+    failures the frontend can act on (currently: code "language_mismatch")."""
     project = _load_owned_project(project_id, uid)
 
-    status = job_status.get(project_id, {"status": "idle", "error": None})
+    status = job_status.get(project_id, {"status": "idle", "error": None, "details": None})
     return {
         **project,
         "status": status["status"],
         "error": status["error"],
+        "errorDetails": status.get("details"),
         "videoUrl": _video_url(project["current_video"]) if project.get("current_video") else None,
     }
 

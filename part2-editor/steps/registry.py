@@ -53,17 +53,30 @@ def run_step(step_name: str, project: dict, **kwargs) -> dict:
 
 def run_all(project: dict, steps: list = None, step_params: dict = None) -> dict:
     """
-    Runs the given steps (default: full STEP_ORDER) in priority order
-    against the same project manifest, persisting after each one.
+    Runs the given steps (default: full STEP_ORDER) in the order given
+    against the same project manifest. Each step persists its own result
+    (via record_step) as it finishes, so a failure part-way through leaves
+    the earlier steps' results saved.
+
+    Every step name is checked BEFORE anything runs, so a typo like
+    "captoins" fails immediately instead of after earlier steps have already
+    modified the project.
 
     step_params: optional {step_name: {kwarg: value, ...}} -- lets a caller
     pass per-step options (e.g. {"subtitle_styles": {"style": "boxed",
-    "font_name": "modern"}}) without every step needing to accept every
-    other step's kwargs. A step with no entry in step_params just runs with
-    its own defaults, same as before this param existed.
+    "font_name": "modern"}}, or {"captions": {"language": "hi",
+    "script": "roman", "on_mismatch": "raise"}}) without every step needing
+    to accept every other step's kwargs. A step with no entry in step_params
+    just runs with its own defaults, same as before this param existed.
     """
     step_params = step_params or {}
-    for step_name in (steps or STEP_ORDER):
+    to_run = steps or STEP_ORDER
+
+    unknown = [name for name in to_run if name not in STEP_REGISTRY]
+    if unknown:
+        raise ValueError(f"Unknown steps {unknown}. Valid steps: {list(STEP_REGISTRY)}")
+
+    for step_name in to_run:
         kwargs = step_params.get(step_name, {})
         project = run_step(step_name, project, **kwargs)
     return project
